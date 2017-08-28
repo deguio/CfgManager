@@ -7,23 +7,23 @@
 bool CfgManager::OptExist(std::string key, int opt)
 {
     for(auto& iopt : opts_)
-        if(iopt.first == "opts."+key && iopt.second.size()>opt)
+        if(iopt.first == "opts."+key && int(iopt.second.size())>opt)
             return true;
 
     return false;
 }
 
 //----------Help method, parse single line------------------------------------------------
-bool CfgManager::ParseSingleLine(std::string& line, std::vector<std::string>& tokens)
+bool CfgManager::ParseSingleLine(std::string& line, option_t& tokens)
 {
     //---parsing utils
     size_t prev=0, pos;
     std::string delimiter=" ";
 
-    //---strip comments and unneeded whitespace
+    //---strip commented lines and unneeded whitespace
     while(line.size() > 0 && line.at(0) == ' ')
         line.erase(line.begin());
-    if(line.size() == 0)
+    if(line.size() == 0 || line.at(0) == '#')
         return false;
     if(line.at(0) == '\'')
     {
@@ -51,18 +51,59 @@ bool CfgManager::ParseSingleLine(std::string& line, std::vector<std::string>& to
     return true;
 }
 
+//----------Help method, parse for loops--------------------------------------------------
+voption_t CfgManager::ParseForLoop(std::ifstream& cfg_file, voption_t& for_cycle)
+{
+    option_t tokens;
+    std::string buffer;
+    while(tokens.size() == 0 || tokens.at(0) != "end")
+    {
+        tokens.clear();
+        if(!getline(cfg_file, buffer))
+        {
+            std::cout << "> CfgManager --- ERROR: runaway for loop, missing end marker. // " << std::endl;
+            exit(-1);
+        }
+        if(ParseSingleLine(buffer, tokens))
+        {
+            //---Nested for loop (recursive)
+            if(tokens.at(0) == "for")
+            {
+                voption_t nested_for_cycle;
+                nested_for_cycle.push_back(tokens);            
+                auto parsed_loop = ParseForLoop(cfg_file, nested_for_cycle);
+                for(auto& token : parsed_loop)
+                        for_cycle.push_back(token);
+            }
+            else
+            {
+                //---multiple lines option inside for-loop
+                while(tokens.back() == "\\")
+                {
+                    tokens.pop_back();
+                    getline(cfg_file, buffer);
+                    ParseSingleLine(buffer, tokens);                    
+                }
+                for_cycle.push_back(tokens);
+            }
+        }
+    }
+
+    return HandleForLoop(for_cycle);
+}
+
 //----------Parse configuration file and setup the configuration--------------------------
 void CfgManager::ParseConfigFile(const char* file)
 {
     std::cout << "> CfgManager --- INFO: parsing " << file << std::endl;
     //---read config file
-    std::ifstream cfgFile(file, std::ios::in);
+    std::ifstream cfg_file(file, std::ios::in);
     std::string buffer;
     std::string current_block="opts";
-    while(getline(cfgFile, buffer))
+    while(getline(cfg_file, buffer))
     {
         //---parse the current line
-        std::vector<std::string> tokens;
+        option_t tokens;
         if(!ParseSingleLine(buffer, tokens))
             continue;
 
@@ -70,36 +111,25 @@ void CfgManager::ParseConfigFile(const char* file)
         while(tokens.back() == "\\")
         {
             tokens.pop_back();
-            getline(cfgFile, buffer);
+            getline(cfg_file, buffer);
             ParseSingleLine(buffer, tokens);
         }
         //---for loop
         if(tokens.at(0) == "for")
         {
-            std::vector<std::vector<std::string> > for_cycle;
-            for_cycle.push_back(tokens);            
-            while(tokens.at(0) != "end")
-            {
-                tokens.clear();
-                getline(cfgFile, buffer);
-                ParseSingleLine(buffer, tokens);
-                //---multiple lines option inside for-loop
-                while(tokens.back() == "\\")
-                {
-                    tokens.pop_back();
-                    getline(cfgFile, buffer);
-                    ParseSingleLine(buffer, tokens);                    
-                }
-                for_cycle.push_back(tokens);                
-            }
-            //---call the for loop method removing the end line
-            HandleForLoop(current_block, for_cycle);
+            voption_t for_cycle;
+            for_cycle.push_back(tokens);
+            //---get the options from the loop
+            auto parsed_loop = ParseForLoop(cfg_file, for_cycle);
+            for(auto& tokens : parsed_loop)
+                HandleOption(current_block, tokens);
+
         }
         //---store the option inside the current configuration
         else
             HandleOption(current_block, tokens);
     }
-    cfgFile.close();
+    cfg_file.close();
     
     //---set automatic info
     char hostname[100];
@@ -120,7 +150,7 @@ void CfgManager::ParseConfigString(const std::string config)
     std::string current_block="opts";
     //---parse the current string
     std::string local_copy = config;
-    std::vector<std::string> tokens;
+    option_t tokens;
     ParseSingleLine(local_copy, tokens);
     HandleOption(current_block, tokens);
 
@@ -128,19 +158,22 @@ void CfgManager::ParseConfigString(const std::string config)
 }
 
 //----------Handle for-loop---------------------------------------------------------------
-void CfgManager::HandleForLoop(std::string& current_block, std::vector<std::vector<std::string> >& for_cycle)
+voption_t CfgManager::HandleForLoop(voption_t& for_cycle)
 {
     //---get for-loop range
     if(for_cycle.at(0).size() < 3)
     {
         std::cout << "> CfgManager --- ERROR: for loop is undefined, provide at least 3 arguments. // " << std::endl;
         exit(-1);
-    }
+    }        
     auto loop_def = for_cycle.at(0);
     auto loop_var = loop_def.at(1);
     for_cycle.pop_back();
     for_cycle.erase(for_cycle.begin());
 
+    //---output expanded loop
+    voption_t parsed_loop;
+    
     //---rage loop [min, max) optional increment value
     if(loop_def.size() >= 4)
     {
@@ -150,40 +183,38 @@ void CfgManager::HandleForLoop(std::string& current_block, std::vector<std::vect
         for(int i=stoi(loop_def.at(2)); i<stoi(loop_def.at(3)); i=i+increment)
             for(auto line : for_cycle)
             {
-                std::vector<std::string> tokens;
+                option_t tokens;
                 for(auto token : line)
                 {
                     while(token.find("$"+loop_var) != std::string::npos)
                         token.replace(token.find("$"+loop_var), loop_var.size()+1, std::to_string(i));
                     tokens.push_back(token);
                 }
-                HandleOption(current_block, tokens);
+                parsed_loop.push_back(tokens);
             }
     }
     //---for each loop, third argument must be a valid option.
     else if(loop_def.size() == 3 && OptExist(loop_def.at(2)))
-        for(auto& i : GetOpt<std::vector<std::string> >(loop_def.at(2)))
+        for(auto& i : GetOpt<option_t >(loop_def.at(2)))
             for(auto& line : for_cycle)
             {
-                std::vector<std::string> tokens;
-                for(auto& token : line)
+                option_t tokens;                
+                for(auto token : line)
                 {
                     while(token.find("$"+loop_var) != std::string::npos)
                         token.replace(token.find("$"+loop_var), loop_var.size()+1, i);
                     tokens.push_back(token);
                 }
-                HandleOption(current_block, tokens);
+                parsed_loop.push_back(tokens);
             }
+
+    return parsed_loop;
 }
 
 //----------Handle single option: key and parameters--------------------------------------
 //---private methode called by ParseConfig public methods
-void CfgManager::HandleOption(std::string& current_block, std::vector<std::string>& tokens)
+void CfgManager::HandleOption(std::string& current_block, option_t& tokens)
 {
-    //---skip comments
-    if(tokens.at(0).at(0) == '#')
-        return;
-
     //---Handle blocks
     if(tokens.at(0).at(0) == '<')
     {        
@@ -215,6 +246,7 @@ void CfgManager::HandleOption(std::string& current_block, std::vector<std::strin
             }
             tokens.at(0).erase(--tokens.at(0).end());            
             current_block += "."+tokens.at(0);
+            opts_[current_block];
             //---copy from other blocks
             if(copy_blocks)
             {
@@ -228,8 +260,8 @@ void CfgManager::HandleOption(std::string& current_block, std::vector<std::strin
     else if(tokens.at(0) == "importCfg")
     {
         tokens.erase(tokens.begin());
-        for(auto& cfgFile: tokens)
-            ParseConfigFile(cfgFile.c_str());
+        for(auto& cfg_file: tokens)
+            ParseConfigFile(cfg_file.c_str());
     }
     //---option line
     else
@@ -243,9 +275,10 @@ void CfgManager::HandleOption(std::string& current_block, std::vector<std::strin
             key = key.substr(0, key.size()-2);
             for(auto& token : tokens)
             {
-                if(OptExist(token))
+                auto token_full = Lookup(current_block, token);
+                if(OptExist(token_full))
                 {
-                    auto extend_opt = GetOpt<std::vector<std::string> >(token);
+                    auto extend_opt = GetOpt<option_t >(token_full);
                     opts_[current_block+"."+key].insert(opts_[current_block+"."+key].end(),
                                                         extend_opt.begin(),
                                                         extend_opt.end());
@@ -258,21 +291,23 @@ void CfgManager::HandleOption(std::string& current_block, std::vector<std::strin
         else if(key.substr(key.size()-1) == "=" && tokens.size() > 0)
         {
             auto copy = tokens.at(0);
-            key = key.substr(0, key.size()-1);
-            //---copy only selected option field
+            int pos = -1;
             if(copy.find("[") != std::string::npos)
             {
-                if(OptExist(copy.substr(0, copy.find("[")), stoi(copy.substr(copy.find("[")+1, copy.find("]")-copy.find("[")-1))))
-                {
-                    int pos = stoi(copy.substr(copy.find("[")+1, copy.find("]")-copy.find("[")-1));
-                    copy = copy.substr(0, copy.find("["));
-                    
-                    opts_[current_block+"."+key].push_back(GetOpt<std::string>(copy, pos));
-                }
+                pos = stoi(copy.substr(copy.find("[")+1, copy.find("]")-copy.find("[")-1));
+                copy = copy.substr(0, copy.find("["));
             }
-            //--copy entire option
-            else if(OptExist(copy))
-                opts_[current_block+"."+key] = GetOpt<std::vector<std::string> >(copy);
+            copy = Lookup(current_block, copy);
+            key = key.substr(0, key.size()-1);
+            if(OptExist(copy))
+            {
+                //---copy only selected option field
+                if(pos != -1)
+                    opts_[current_block+"."+key].push_back(GetOpt<std::string>(copy, pos));            
+                //--copy entire option
+                else 
+                    opts_[current_block+"."+key] = GetOpt<option_t >(copy);
+            }
             //---throw error
             else
                 std::cout << "> CfgManager --- WARNING: undefined option // " << copy << std::endl;
@@ -289,17 +324,19 @@ void CfgManager::HandleOption(std::string& current_block, std::vector<std::strin
 //---already defined option are overridden
 void CfgManager::CopyBlock(std::string& current_block, std::string& block_to_copy)
 {
-    bool found_any=false;
+    //---search for the correct block name
+    auto block_to_copy_full = Lookup(current_block, block_to_copy);
+    bool found_any=false;    
     //---copy block entries
     for(auto& opt : opts_)
     {
         std::string key = opt.first;
-        size_t pos = key.find("."+block_to_copy+".");
+        auto pos = key.find("."+block_to_copy_full+".");
         if(pos != std::string::npos)
         {
             std::string new_key = key;
-            std::vector<std::string>& opts = opt.second;
-            new_key.replace(pos+1, block_to_copy.size(), current_block.substr(5));
+            option_t& opts = opt.second;
+            new_key.replace(pos+1, block_to_copy_full.size(), current_block.substr(5));
             opts_[new_key] = opts;
 
             found_any=true;
@@ -314,18 +351,18 @@ void CfgManager::CopyBlock(std::string& current_block, std::string& block_to_cop
 
 //----------Print formatted version of the cfg--------------------------------------------
 //---option is the key to be print: default value meas "all keys"
-void CfgManager::Print(Option_t* option) const
+void CfgManager::Print(std::ostream& out, Option_t* option) const
 {
     std::string argkey = option;
     //---banner
     std::string banner = "configuration was created by "+username_+" on "+timestamp_;
     for(int i=0; i<banner.size(); ++i)
-        std::cout << "=";
-    std::cout << std::endl;
-    std::cout << banner << std::endl;
+        out << "=";
+    out << std::endl;
+    out << banner << std::endl;
     for(int i=0; i<banner.size(); ++i)
-        std::cout << "=";
-    std::cout << std::endl;
+        out << "=";
+    out << std::endl;
     
     //---options
     std::string prev_block="";
@@ -337,19 +374,50 @@ void CfgManager::Print(Option_t* option) const
             if(current_block != prev_block)
             {
                 if(prev_block != "")
-                    std::cout << "+----------" << std::endl;
-                std::cout << current_block << ":" << std::endl;
+                    out << "+----------" << std::endl;
+                out << current_block << ":" << std::endl;
                 prev_block = current_block;
             }
-            std::cout << "|----->" << key.first.substr(key.first.find_last_of(".")+1) << ": ";
-            for(auto& opt : key.second)
-                std::cout << opt << ", " ;
-            std::cout << std::endl;
+            if(key.second.size())
+            {
+                out << "|----->" << key.first.substr(key.first.find_last_of(".")+1) << ": ";
+                for(auto& opt : key.second)
+                    out << opt << ", " ;
+                out << std::endl;
+            }
         }
     }
-    std::cout << "+----------" << std::endl;
+    out << "+----------" << std::endl;
 
     return;
+}
+
+//----------ROOT-style Print function-----------------------------------------------------
+void CfgManager::Print(Option_t* option) const
+{
+    Print(std::cout, option);
+
+    return;
+}
+
+//----------Lookup for full option/block name---------------------------------------------
+//---search for option/block in the options map:
+//---1) first for an exact match
+//---2) otherwise for the first match going backwards from the current block
+std::string CfgManager::Lookup(std::string& current_block, std::string& token)
+{
+    if(OptExist(token, -1))
+        return token;
+    else if(current_block != "opts" && OptExist(current_block.substr(5)+"."+token, -1))
+        return current_block.substr(5)+"."+token;
+    else if(current_block.find('.') != std::string::npos)
+    {
+        auto prev_block = current_block.substr(0, current_block.find_last_of('.'));
+        auto try_token = prev_block == "opts" ? token : prev_block.substr(5)+"."+token;
+        return Lookup(prev_block, try_token);        
+    }
+    else
+        return std::string("");
 }
 
 //----------Internal error check----------------------------------------------------------
@@ -373,14 +441,7 @@ void CfgManager::Errors(std::string key, int opt)
 
 std::ostream& operator<<(std::ostream& out, const CfgManager& obj)
 {
-    //---banner
-    out << "configuration: " << std::endl;
-    //---options
-    for(auto& key : obj.opts_)
-    {
-        out << key.first.substr(5) << ":" << std::endl;
-        for(auto& opt : key.second)
-            out << "\t" << opt << std::endl;
-    }
+    obj.Print(out);
+    
     return out;
 }
